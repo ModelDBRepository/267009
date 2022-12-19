@@ -1,0 +1,185 @@
+// to reach steady state or spike failure, increase n_count
+load_file("nrngui.hoc")
+
+nm = 32		//number of myelin
+
+create axon[nm-1]
+create myelin[nm]
+
+for i = 0, nm-2 {
+	connect axon[i](0), myelin[i](1)
+	connect myelin[i+1](0), axon[i](1)
+}
+
+objref diam_list, curr_list,fr_list
+diam_list = new Vector()
+curr_list = new Vector()
+fr_list = new Vector()
+
+diam_list.append(0.2,0.6,1)
+
+curr_list.append(0.0045,0.022,0.046)
+
+fr_list.append(1,10,20,30,40,50,60,70,80,90,100)
+
+diam_ind = 0
+
+forsec "axon" {L = 1 diam = diam_list.x[diam_ind] nseg = 1}
+forsec "myelin" {L = 100 diam = diam_list.x[diam_ind] nseg = 3}
+myelin[0] {L = 50 nseg = 3}
+myelin[nm-1] {L = 50 nseg = 3}
+
+f_nak = 1
+
+forsec "axon" {
+	Ra = 120
+	cm = 1
+	insert na
+	insert kd
+	insert ka
+	insert leak
+	
+	gmax_na = 0.015
+	gmax_kd = 0.216
+	gmax_ka = 0.02
+	gmax_leak  = 0.000125		// Rm = 8 Kohm cm2, not really leaky
+	insert nadp
+	
+	TotalPump_nadp = 5e-13*f_nak	// density mol/cm2
+}
+
+forsec "myelin" {
+	Ra = 120
+	cm = 0.01
+	insert leak
+	gmax_leak = 0.000125*0.01
+	insert nadp
+	TotalPump_nadp = 5e-13*0	// density mol/cm2
+}
+
+v_init = -70
+dt = 0.05
+steps_per_ms = 1/dt
+tstart = 2000
+tseg = 1e4
+tsim = 1.5e4
+tstop = tstart+tsim
+Freqmax = 20		//burst frequency, no need to change it, here no bursting like PD will be explored.
+global_q10 = 1		// no temperature effect
+celsius = 6.3
+
+NPULSES = 2e15		// number of spikes per burst, only 1 burst will be simulated
+objref stim
+axon[0] stim = new Ipulse3(0.5)
+stim.dur = 1
+stim.amp = curr_list.x[diam_ind]
+
+nb = tstop/1000*Freqmax
+objref ns[nb], connection[nb]
+
+freq_burst = 1e-23
+freq_spike = 1		//ISI between spikes during burst
+
+objref volvec, navec
+
+strdef tmpstr
+strdef outDir
+strdef cmd 
+objref outfile
+outfile = new File()
+
+sprint(outDir,"pub/p_nak_%02d",f_nak)
+sprint(cmd, "system(\"mkdir -p %s\")",outDir)
+execute(cmd)
+
+objref pc
+pc = new ParallelContext()
+print "number of hosts: ", pc.nhost(), "\thost id: ", pc.id() 
+
+func distscale() {local key, errval, fr_id, dia_id localobj parvec, returnlist
+	key = $1
+	fr_id = int($1/100)
+	dia_id = $1 - fr_id*100
+	returnlist = new Vector()
+	returnlist = calc_na_single(fr_id,dia_id)
+	pc.pack(returnlist)
+	pc.post(key)
+	return key
+}
+
+obfunc calc_na_single() {localobj outlist, na_v,na0_v,na1_v,na2_v, v_v0,v_v1,v_v2,dum
+	//function to calculate the max deflection due to a single synapse
+	f_id = $1
+	d_id = $2
+	
+	freq_spike = fr_list.x[f_id]			// change fr
+	forsec "axon" {diam = diam_list.x[d_id]}		// change diameter
+	forsec "myelin" {diam = diam_list.x[d_id]}	
+	stim.amp = curr_list.x[d_id]		// change stimulus amplitude
+	for k = 0,nb-1 {
+		ns[k] = new NetStim(0.5) // Location of NetStim is arbitrary
+		ns[k].interval = 1000/freq_spike// ms (mean) time between spikes
+		ns[k].number = NPULSES // (average) number of spikes
+		ns[k].start = tstart+50 // ms (mean) start time of first spike 
+		ns[k].noise = 0
+		connection[k] = new NetCon(ns[k], stim)
+		connection[k].delay = 0.1+1000*k/freq_burst
+	}
+
+	
+	v_v2 = new Vector()
+	v_v2.buffer_size(tseg/dt)
+	v_v2.record(&axon[nm-2].v(0.5))		//end
+
+	na2_v = new Vector()
+	na2_v.buffer_size(tseg/dt)
+	na2_v.record(&axon[nm-2].nai(0.5))
+	
+	finitialize(v_init)
+
+		n_count = 2
+	for count = 0,n_count {
+		continuerun(t+tseg)
+		printf ("time is %f\n",t)
+
+
+		sprint(tmpstr,"%s/fr%02d_di%02d_vA2_%03d.dat",outDir,f_id,d_id,count)
+		outfile.wopen(tmpstr)
+		dum = new Vector()
+		dum.resample(v_v2,1)
+		dum.printf(outfile)
+		outfile.close()		
+		
+
+		sprint(tmpstr,"%s/fr%02d_di%02d_na02_%03d.dat",outDir,f_id,d_id,count)
+		outfile.wopen(tmpstr)
+		dum = new Vector()
+		dum.resample(na2_v,0.01)
+		dum.printf(outfile)
+		outfile.close()
+		
+		frecord_init()
+	}
+	
+	return diam_list	//dum
+}
+
+pc.runworker()
+
+proc calc_nas() {
+	i = 0
+	for i =  0, $1 {	//	for case (&i, 0,4) {
+		for j = 0, $2 {
+			mmtag = i*100 + j
+			pc.submit("distscale",mmtag)	//send out the error calculations
+		}
+	}
+	//collect error values
+	while (pc.working()) {
+		key = pc.retval()	//retrieve the tag
+		pc.look_take(key)	//remove the tag/job from the bulletin
+		print "received key ",key
+	}
+}
+
+calc_nas(10,2)	//several arguments to pass frequency, diameter

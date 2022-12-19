@@ -1,0 +1,214 @@
+// the pump density can in the range of 1e-13 5e-13,1e-12,5e-12
+load_file("nrngui.hoc")
+
+objref diam_list, curr_list,fr_list
+diam_list = new Vector()
+curr_list = new Vector()
+fr_list = new Vector()
+
+diam_list.append(0.2, 0.6, 1)
+curr_list.append(0.0267,0.158,0.351)
+fr_list.append(1,10,20,30,40,50,60,70,80,90,100)	// kind of kill the length constant effect, by focusing on v(0.5)
+
+diam_ind = 0
+
+create axon
+axon {nseg = 51 L = 3131}
+
+f_nak = 1	// 1;2;4;6;8;10
+
+axon {
+
+	cm = 1
+	Ra = 120
+	insert na
+	insert kd
+	insert ka
+	insert leak
+
+	gmax_na = 0.015
+	gmax_kd = 0.216
+	gmax_ka = 0.02
+	gmax_leak  = 0.000125		// Rm = 8 Kohm cm2, not really leaky
+	insert nadp
+	
+	TotalPump_nadp = 5e-13*f_nak	// density mol/cm2
+	nai_i_nadp = 10.59
+}
+v_init = -70
+dt = 0.05
+steps_per_ms = 1/dt
+tstart = 2000
+tsim = 50000*2
+tstop = tstart+tsim
+tstop = 1.5e5
+Freqmax = 20		//burst frequency, no need to change it, here no bursting like PD will be explored.
+global_q10 = 1		// no temperature effect
+celsius = 6.3
+
+NPULSES = 1.4e9		// number of spikes per burst, only 1 burst will be simulated
+objref stim
+axon stim = new Ipulse3(0)
+stim.dur = 1
+stim.amp = curr_list.x[diam_ind]
+
+nb = tstop/1000*Freqmax
+objref ns[nb], connection[nb]
+
+freq_burst = 1e-23
+freq_spike = 1		//ISI between spikes during burst
+
+objref pc
+pc = new ParallelContext()
+print "number of hosts: ", pc.nhost(), "\thost id: ", pc.id() 
+
+func distscale() {local key, errval, fr_id, dia_id localobj parvec, returnlist
+	key = $1
+	fr_id = int($1/100)
+	dia_id = $1 - fr_id*100
+
+	returnlist = new List()
+	returnlist = calc_na_single(fr_id,dia_id)
+
+	pc.pack(returnlist.o(0))
+	pc.pack(returnlist.o(1))
+	pc.pack(returnlist.o(2))
+	pc.pack(returnlist.o(3))
+	pc.pack(returnlist.o(4))
+	pc.pack(returnlist.o(5))
+
+	pc.post(key)
+	return key
+}
+
+obfunc calc_na_single() {localobj outlist, v_v0,v_v1,v_v2,na_v0, na_v1,na_v2
+	//function to calculate the max deflection due to a single synapse
+	f_id = $1
+	d_id = $2
+	freq_spike = fr_list.x[f_id]			// change fr
+	axon {diam = diam_list.x[d_id]}		// change diameter
+	stim.amp = curr_list.x[d_id]		// change stimulus amplitude
+	for k = 0,nb-1 {
+		ns[k] = new NetStim(0.5) // Location of NetStim is arbitrary
+		ns[k].interval = 1000/freq_spike// ms (mean) time between spikes
+		ns[k].number = NPULSES // (average) number of spikes
+		ns[k].start = tstart+50 // ms (mean) start time of first spike 
+		ns[k].noise = 0
+		connection[k] = new NetCon(ns[k], stim)
+		connection[k].delay = 0.1+1000*k/freq_burst
+	}
+	
+	outlist=new List()
+	
+	v_v0 = new Vector()
+	v_v0.record(&axon.v(0))	
+	v_v1 = new Vector()
+	v_v1.record(&axon.v(0.5))
+	v_v2 = new Vector()
+	v_v2.record(&axon.v(0.98403066))	
+
+	na_v0 = new Vector()
+	na_v0.record(&axon.nai(0),4)
+	na_v1 = new Vector()
+	na_v1.record(&axon.nai(0.5),4)
+	na_v2 = new Vector()
+	na_v2.record(&axon.nai(0.98403066),4)
+	
+	/******	Details: Transfers take place on exit from finitialize() and on exit from fadvance(). *******/
+	
+	finitialize(v_init)
+
+	continuerun(tstop)
+	
+	outlist.append(v_v0)
+	outlist.append(v_v1)
+	outlist.append(v_v2)
+	
+	outlist.append(na_v0)
+	outlist.append(na_v1)
+	outlist.append(na_v2)
+	
+	return outlist
+}
+
+pc.runworker()
+
+objref volvec0,volvec1,volvec2, navec0,navec1,navec2
+
+volvec0 = new Vector()
+volvec1 = new Vector()
+volvec2 = new Vector()
+
+navec0 = new Vector()
+navec1 = new Vector()
+navec2 = new Vector()
+
+strdef tmpstr
+strdef outDir
+strdef cmd 
+objref outfile
+outfile = new File()
+
+proc calc_nas() {
+
+	sprint(outDir,"simdata/p_nak_%02d",f_nak)
+	sprint(cmd, "system(\"mkdir -p %s\")",outDir)
+	execute(cmd)
+
+	for i = 0, $1 {
+		for j = 0, $2 {
+			mmtag = i*100 + j
+			pc.submit("distscale",mmtag)	//send out the error calculations
+		}
+	}
+	//collect error values
+	while (pc.working()) {
+		key = pc.retval()	//retrieve the tag
+		pc.look_take(key)	//remove the tag/job from the bulletin
+		
+		volvec0 = pc.upkvec()	//unpack the error value associated with the tag
+		volvec1 = pc.upkvec()
+		volvec2 = pc.upkvec()
+
+		navec0 = pc.upkvec()
+		navec1 = pc.upkvec()
+		navec2 = pc.upkvec()
+		
+		print "received key ",key
+
+		fno= int(key/100)
+		dno  = key -fno*100
+		
+		sprint(tmpstr,"%s/fr%02d_di%02d_v00.dat",outDir,fno,dno)
+		outfile.wopen(tmpstr)
+		volvec0.printf(outfile)
+		outfile.close()
+		
+		sprint(tmpstr,"%s/fr%02d_di%02d_v01.dat",outDir,fno,dno)
+		outfile.wopen(tmpstr)
+		volvec1.printf(outfile)
+		outfile.close()
+		
+		sprint(tmpstr,"%s/fr%02d_di%02d_v02.dat",outDir,fno,dno)
+		outfile.wopen(tmpstr)
+		volvec2.printf(outfile)
+		outfile.close()
+		
+		sprint(tmpstr,"%s/fr%02d_di%02d_na00.dat",outDir,fno,dno)
+		outfile.wopen(tmpstr)
+		navec0.printf(outfile)
+		outfile.close()
+		
+		sprint(tmpstr,"%s/fr%02d_di%02d_na01.dat",outDir,fno,dno)
+		outfile.wopen(tmpstr)
+		navec1.printf(outfile)
+		outfile.close()
+
+		sprint(tmpstr,"%s/fr%02d_di%02d_na02.dat",outDir,fno,dno)
+		outfile.wopen(tmpstr)
+		navec2.printf(outfile)
+		outfile.close()		
+	}
+}
+
+calc_nas(10,2)	//several arguments to pass frequency, diameter
